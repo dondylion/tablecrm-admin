@@ -54,8 +54,8 @@ export async function POST(request: NextRequest) {
       body: JSON.stringify({
         model,
         messages: [{ role: "user", content: cleanPrompt }],
-        temperature: 0.9,
-        max_tokens: 220,
+        temperature: 0.7,
+        max_tokens: 700,
       }),
       cache: "no-store",
     });

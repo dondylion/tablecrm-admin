@@ -92,7 +92,17 @@ type AiGeneratedFields = {
   seo_keywords: string[];
 };
 
-function parseAiJson(text: string): AiGeneratedFields | null {
+type AiGeneratedPartial = Partial<AiGeneratedFields>;
+
+function decodeJsonString(value: string) {
+  try {
+    return JSON.parse(`"${value}"`) as string;
+  } catch {
+    return value;
+  }
+}
+
+function parseAiJson(text: string): AiGeneratedPartial {
   const candidates: string[] = [text];
   const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
   if (fenced?.[1]) {
@@ -105,30 +115,51 @@ function parseAiJson(text: string): AiGeneratedFields | null {
 
   for (const candidate of candidates) {
     try {
-      const parsed = JSON.parse(candidate) as Partial<AiGeneratedFields>;
+      const parsed = JSON.parse(candidate) as AiGeneratedPartial;
       const keywords = Array.isArray(parsed.seo_keywords)
         ? parsed.seo_keywords.filter((item): item is string => typeof item === "string").map((item) => item.trim()).filter(Boolean)
         : [];
-      if (
-        typeof parsed.description_short === "string" &&
-        typeof parsed.description_long === "string" &&
-        typeof parsed.seo_title === "string" &&
-        typeof parsed.seo_description === "string"
-      ) {
-        return {
-          description_short: parsed.description_short.trim(),
-          description_long: parsed.description_long.trim(),
-          seo_title: parsed.seo_title.trim(),
-          seo_description: parsed.seo_description.trim(),
-          seo_keywords: keywords,
-        };
+      const partial: AiGeneratedPartial = {};
+      if (typeof parsed.description_short === "string") {
+        partial.description_short = parsed.description_short.trim();
+      }
+      if (typeof parsed.description_long === "string") {
+        partial.description_long = parsed.description_long.trim();
+      }
+      if (typeof parsed.seo_title === "string") {
+        partial.seo_title = parsed.seo_title.trim();
+      }
+      if (typeof parsed.seo_description === "string") {
+        partial.seo_description = parsed.seo_description.trim();
+      }
+      partial.seo_keywords = keywords;
+      if (Object.keys(partial).length > 0) {
+        return partial;
       }
     } catch {
       // ignore malformed candidates
     }
   }
 
-  return null;
+  const regexPartial: AiGeneratedPartial = {};
+  const fields = ["description_short", "description_long", "seo_title", "seo_description"] as const;
+  for (const field of fields) {
+    const pattern = new RegExp(`"${field}"\\s*:\\s*"((?:\\\\.|[^"\\\\])*)"`, "i");
+    const match = text.match(pattern);
+    if (match?.[1]) {
+      regexPartial[field] = decodeJsonString(match[1]).trim();
+    }
+  }
+
+  const keywordsMatch = text.match(/"seo_keywords"\s*:\s*\[([\s\S]*?)\]/i);
+  if (keywordsMatch?.[1]) {
+    const keywordItems = [...keywordsMatch[1].matchAll(/"((?:\\.|[^"\\])*)"/g)]
+      .map((item) => decodeJsonString(item[1]).trim())
+      .filter(Boolean);
+    regexPartial.seo_keywords = keywordItems;
+  }
+
+  return regexPartial;
 }
 
 function validate(values: ProductFormValues): FieldErrors {
@@ -291,17 +322,34 @@ export default function ProductCreateForm() {
       }
 
       const generated = parseAiJson(body.text ?? "");
-      if (!generated) {
-        throw new Error("AI вернул ответ в неожиданном формате");
+      const hasAnyGeneratedField =
+        !!generated.description_short ||
+        !!generated.description_long ||
+        !!generated.seo_title ||
+        !!generated.seo_description ||
+        (generated.seo_keywords?.length ?? 0) > 0;
+      if (!hasAnyGeneratedField) {
+        throw new Error("AI вернул пустой ответ. Нажмите кнопку еще раз.");
       }
+
+      const fallbackShort = `${productName} - качественный товар, который помогает решать повседневные задачи и подходит для широкого круга покупателей.`;
+      const fallbackLong = `${productName} создан для тех, кто ценит надежность и удобство использования. Товар сочетает практичность, стабильное качество и понятный сценарий применения. Он подходит как для регулярного использования, так и для отдельных задач, где важны результат и экономия времени. Выбирая ${productName}, вы получаете сбалансированное решение по цене и функциональности.`;
+      const fallbackSeoTitle = `${productName} - купить по выгодной цене`;
+      const fallbackSeoDescription = (generated.description_short || fallbackShort).slice(0, 160);
+      const fallbackKeywords = [
+        productName,
+        `купить ${productName}`,
+        `${productName} цена`,
+        `${productName} доставка`,
+      ];
 
       setValues((prev) => ({
         ...prev,
-        description_short: generated.description_short || prev.description_short,
-        description_long: generated.description_long || prev.description_long,
-        seo_title: generated.seo_title || prev.seo_title,
-        seo_description: generated.seo_description || prev.seo_description,
-        seo_keywords: generated.seo_keywords.length > 0 ? generated.seo_keywords.join(", ") : prev.seo_keywords,
+        description_short: generated.description_short || fallbackShort,
+        description_long: generated.description_long || fallbackLong,
+        seo_title: generated.seo_title || fallbackSeoTitle,
+        seo_description: generated.seo_description || fallbackSeoDescription,
+        seo_keywords: (generated.seo_keywords?.length ?? 0) > 0 ? generated.seo_keywords!.join(", ") : fallbackKeywords.join(", "),
       }));
       setErrors((prev) => ({
         ...prev,
@@ -311,7 +359,13 @@ export default function ProductCreateForm() {
         seo_description: undefined,
         seo_keywords: undefined,
       }));
-      setServerMessage("AI заполнил описания и SEO-поля");
+      const usedFallback =
+        !generated.description_short ||
+        !generated.description_long ||
+        !generated.seo_title ||
+        !generated.seo_description ||
+        (generated.seo_keywords?.length ?? 0) === 0;
+      setServerMessage(usedFallback ? "AI ответил частично, недостающие поля заполнены автоматически" : "AI заполнил описания и SEO-поля");
     } catch (error) {
       setServerError(error instanceof Error ? error.message : "Ошибка AI-генерации");
     } finally {
