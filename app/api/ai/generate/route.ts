@@ -26,6 +26,47 @@ function extractText(content: unknown): string {
   return "";
 }
 
+function extractTextFromResponse(parsed: Record<string, unknown>): string {
+  const choices = parsed?.choices as Array<Record<string, unknown>> | undefined;
+  if (Array.isArray(choices) && choices.length > 0) {
+    for (const choice of choices) {
+      const message = choice?.message as Record<string, unknown> | undefined;
+      const fromMessage = extractText(message?.content);
+      if (fromMessage) {
+        return fromMessage;
+      }
+
+      const fromText = typeof choice?.text === "string" ? choice.text.trim() : "";
+      if (fromText) {
+        return fromText;
+      }
+
+      const reasoning = typeof choice?.reasoning === "string" ? choice.reasoning.trim() : "";
+      if (reasoning) {
+        return reasoning;
+      }
+    }
+  }
+
+  const outputText = typeof parsed?.output_text === "string" ? parsed.output_text.trim() : "";
+  if (outputText) {
+    return outputText;
+  }
+
+  const output = parsed?.output as Array<Record<string, unknown>> | undefined;
+  if (Array.isArray(output)) {
+    for (const item of output) {
+      const content = item?.content as unknown;
+      const fromContent = extractText(content);
+      if (fromContent) {
+        return fromContent;
+      }
+    }
+  }
+
+  return "";
+}
+
 export async function POST(request: NextRequest) {
   try {
     const { prompt } = (await request.json()) as { prompt?: string };
@@ -71,11 +112,24 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: message }, { status: upstream.status });
     }
 
-    const choices = parsed?.choices as Array<{ message?: { content?: unknown } }> | undefined;
-    const content = choices?.[0]?.message?.content;
-    const text = extractText(content);
+    const text = extractTextFromResponse(parsed);
 
-    return NextResponse.json({ text: text || "Empty response from model" });
+    if (!text) {
+      const providerHint =
+        typeof parsed?.provider === "string"
+          ? parsed.provider
+          : (parsed?.error as { message?: string } | undefined)?.message;
+      return NextResponse.json(
+        {
+          error: providerHint
+            ? `Модель не вернула текст (provider: ${providerHint}). Попробуйте снова.`
+            : "Модель не вернула текст. Попробуйте снова.",
+        },
+        { status: 502 },
+      );
+    }
+
+    return NextResponse.json({ text });
   } catch (error) {
     return NextResponse.json(
       { error: error instanceof Error ? error.message : "Unexpected server error" },
