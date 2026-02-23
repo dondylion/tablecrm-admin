@@ -92,74 +92,70 @@ type AiGeneratedFields = {
   seo_keywords: string[];
 };
 
-type AiGeneratedPartial = Partial<AiGeneratedFields>;
-
-function decodeJsonString(value: string) {
-  try {
-    return JSON.parse(`"${value}"`) as string;
-  } catch {
-    return value;
+function extractDescriptionText(raw: string): string | null {
+  const text = raw.trim();
+  if (!text) {
+    return null;
   }
+
+  const fenced = text.match(/```(?:\w+)?\s*([\s\S]*?)```/);
+  const unfenced = (fenced?.[1] ?? text).trim();
+  if (!unfenced) {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(unfenced) as Record<string, unknown>;
+    const descriptionLong = typeof parsed.description_long === "string" ? parsed.description_long.trim() : "";
+    const description = typeof parsed.description === "string" ? parsed.description.trim() : "";
+    const plainText = typeof parsed.text === "string" ? parsed.text.trim() : "";
+
+    if (descriptionLong) {
+      return descriptionLong;
+    }
+    if (description) {
+      return description;
+    }
+    if (plainText) {
+      return plainText;
+    }
+    return null;
+  } catch {
+    // non-JSON is expected now
+  }
+
+  const looksLikeJson = unfenced.startsWith("{") || unfenced.startsWith("[") || unfenced.includes('"description_');
+  if (looksLikeJson) {
+    return null;
+  }
+
+  const normalized = unfenced.replace(/\s+/g, " ").trim();
+  if (normalized.length < 40) {
+    return null;
+  }
+  return unfenced;
 }
 
-function parseAiJson(text: string): AiGeneratedPartial {
-  const candidates: string[] = [text];
-  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  if (fenced?.[1]) {
-    candidates.push(fenced[1]);
-  }
-  const objectLike = text.match(/\{[\s\S]*\}/);
-  if (objectLike?.[0]) {
-    candidates.push(objectLike[0]);
+function extractAnyTextFallback(raw: string): string | null {
+  const text = raw.trim();
+  if (!text) {
+    return null;
   }
 
-  for (const candidate of candidates) {
-    try {
-      const parsed = JSON.parse(candidate) as AiGeneratedPartial;
-      const keywords = Array.isArray(parsed.seo_keywords)
-        ? parsed.seo_keywords.filter((item): item is string => typeof item === "string").map((item) => item.trim()).filter(Boolean)
-        : [];
-      const partial: AiGeneratedPartial = {};
-      if (typeof parsed.description_short === "string") {
-        partial.description_short = parsed.description_short.trim();
-      }
-      if (typeof parsed.description_long === "string") {
-        partial.description_long = parsed.description_long.trim();
-      }
-      if (typeof parsed.seo_title === "string") {
-        partial.seo_title = parsed.seo_title.trim();
-      }
-      if (typeof parsed.seo_description === "string") {
-        partial.seo_description = parsed.seo_description.trim();
-      }
-      partial.seo_keywords = keywords;
-      if (Object.keys(partial).length > 0) {
-        return partial;
-      }
-    } catch {
-      // ignore malformed candidates
-    }
+  const fenced = text.match(/```(?:\w+)?\s*([\s\S]*?)```/);
+  const unfenced = (fenced?.[1] ?? text).trim();
+  if (!unfenced) {
+    return null;
   }
 
-  const regexPartial: AiGeneratedPartial = {};
-  const fields = ["description_short", "description_long", "seo_title", "seo_description"] as const;
-  for (const field of fields) {
-    const pattern = new RegExp(`"${field}"\\s*:\\s*"((?:\\\\.|[^"\\\\])*)"`, "i");
-    const match = text.match(pattern);
-    if (match?.[1]) {
-      regexPartial[field] = decodeJsonString(match[1]).trim();
-    }
-  }
+  // If response is JSON-like but broken, keep only readable text fragments.
+  const compact = unfenced
+    .replace(/[{}\[\]"]/g, " ")
+    .replace(/\b(description_short|description_long|seo_title|seo_description|seo_keywords|json)\b/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 
-  const keywordsMatch = text.match(/"seo_keywords"\s*:\s*\[([\s\S]*?)\]/i);
-  if (keywordsMatch?.[1]) {
-    const keywordItems = [...keywordsMatch[1].matchAll(/"((?:\\.|[^"\\])*)"/g)]
-      .map((item) => decodeJsonString(item[1]).trim())
-      .filter(Boolean);
-    regexPartial.seo_keywords = keywordItems;
-  }
-
-  return regexPartial;
+  return compact.length >= 20 ? compact : null;
 }
 
 function validate(values: ProductFormValues): FieldErrors {
@@ -300,14 +296,11 @@ export default function ProductCreateForm() {
 
     try {
       const prompt = [
-        "Ты маркетолог e-commerce. Верни только JSON без markdown и пояснений.",
+        "Ты маркетолог e-commerce.",
         `Название товара: ${productName}.`,
-        "Сгенерируй поля:",
-        '- description_short (1-2 предложения, до 180 символов)',
-        "- description_long (4-6 предложений с выгодами товара)",
-        "- seo_title (до 70 символов)",
-        "- seo_description (до 160 символов)",
-        "- seo_keywords (массив из 8-12 ключевых фраз на русском)",
+        "Напиши только полное описание товара на русском языке.",
+        "Формат ответа: только чистый текст без JSON, без markdown, без заголовков.",
+        "Объем: 4-6 предложений с выгодами товара.",
       ].join("\n");
 
       const response = await fetch("/api/ai/generate", {
@@ -321,51 +314,26 @@ export default function ProductCreateForm() {
         throw new Error(body.error || "Не удалось получить ответ от AI");
       }
 
-      const generated = parseAiJson(body.text ?? "");
-      const hasAnyGeneratedField =
-        !!generated.description_short ||
-        !!generated.description_long ||
-        !!generated.seo_title ||
-        !!generated.seo_description ||
-        (generated.seo_keywords?.length ?? 0) > 0;
-      if (!hasAnyGeneratedField) {
-        throw new Error("AI вернул пустой ответ. Нажмите кнопку еще раз.");
+      const generatedDescription = extractDescriptionText(body.text ?? "");
+      const fallbackDescription = generatedDescription ? null : extractAnyTextFallback(body.text ?? "");
+      const finalDescription = generatedDescription ?? fallbackDescription;
+      if (!finalDescription) {
+        throw new Error("AI вернул пустой ответ. Попробуйте ещё раз.");
       }
-
-      const fallbackShort = `${productName} - качественный товар, который помогает решать повседневные задачи и подходит для широкого круга покупателей.`;
-      const fallbackLong = `${productName} создан для тех, кто ценит надежность и удобство использования. Товар сочетает практичность, стабильное качество и понятный сценарий применения. Он подходит как для регулярного использования, так и для отдельных задач, где важны результат и экономия времени. Выбирая ${productName}, вы получаете сбалансированное решение по цене и функциональности.`;
-      const fallbackSeoTitle = `${productName} - купить по выгодной цене`;
-      const fallbackSeoDescription = (generated.description_short || fallbackShort).slice(0, 160);
-      const fallbackKeywords = [
-        productName,
-        `купить ${productName}`,
-        `${productName} цена`,
-        `${productName} доставка`,
-      ];
 
       setValues((prev) => ({
         ...prev,
-        description_short: generated.description_short || fallbackShort,
-        description_long: generated.description_long || fallbackLong,
-        seo_title: generated.seo_title || fallbackSeoTitle,
-        seo_description: generated.seo_description || fallbackSeoDescription,
-        seo_keywords: (generated.seo_keywords?.length ?? 0) > 0 ? generated.seo_keywords!.join(", ") : fallbackKeywords.join(", "),
+        description_long: finalDescription,
       }));
       setErrors((prev) => ({
         ...prev,
-        description_short: undefined,
         description_long: undefined,
-        seo_title: undefined,
-        seo_description: undefined,
-        seo_keywords: undefined,
       }));
-      const usedFallback =
-        !generated.description_short ||
-        !generated.description_long ||
-        !generated.seo_title ||
-        !generated.seo_description ||
-        (generated.seo_keywords?.length ?? 0) === 0;
-      setServerMessage(usedFallback ? "AI ответил частично, недостающие поля заполнены автоматически" : "AI заполнил описания и SEO-поля");
+      setServerMessage(
+        generatedDescription
+          ? "AI заполнил полное описание"
+          : "Формат ответа AI был нестандартный, но текст добавлен в полное описание",
+      );
     } catch (error) {
       setServerError(error instanceof Error ? error.message : "Ошибка AI-генерации");
     } finally {
@@ -446,16 +414,6 @@ export default function ProductCreateForm() {
                 className="h-10 w-full rounded-md border bg-background px-3 text-sm outline-none ring-offset-background focus-visible:ring-2 focus-visible:ring-ring"
                 placeholder="Например: Кофемашина Barista Pro"
               />
-              {values.name.trim() ? (
-                <button
-                  type="button"
-                  onClick={onGenerateAi}
-                  disabled={isGeneratingAi || isSubmitting}
-                  className="mt-3 inline-flex h-10 items-center justify-center rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground shadow-sm transition hover:opacity-90 animate-pulse disabled:cursor-not-allowed disabled:opacity-60"
-                >
-                  {isGeneratingAi ? "AI генерирует..." : "Сгененрировать описания с помощью AI"}
-                </button>
-              ) : null}
               <FieldError message={errors.name} />
             </div>
 
@@ -544,6 +502,16 @@ export default function ProductCreateForm() {
                 className="min-h-30 w-full rounded-md border bg-background px-3 py-2 text-sm outline-none ring-offset-background focus-visible:ring-2 focus-visible:ring-ring"
                 placeholder="Подробное описание, преимущества, состав, условия использования"
               />
+              {values.name.trim() ? (
+                <button
+                  type="button"
+                  onClick={onGenerateAi}
+                  disabled={isGeneratingAi || isSubmitting}
+                  className="mt-3 inline-flex h-10 items-center justify-center rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground shadow-sm transition hover:opacity-90 animate-pulse disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  {isGeneratingAi ? "AI генерирует описание..." : "Сгенерировать полное описание с помощью AI"}
+                </button>
+              ) : null}
             </div>
           </div>
         </div>
